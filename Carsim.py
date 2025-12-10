@@ -46,7 +46,7 @@ class Carsim_world:
         Load the necessary Simulink files and initialize the MATLAB engine.
         """
         self.eng = matlab.engine.start_matlab()
-        self.eng.load('Shanghai_center.mat')  # Load the required data file
+        # self.eng.load('Shanghai_center.mat')  # Load the required data file
 
     def set_ini(self):
         """

@@ -1,5 +1,5 @@
 import gym  # Import the OpenAI Gym library for environment creation
-import wandb  # Import the Weights and Biases library for logging (optional, currently unused)
+# import wandb  # Import the Weights and Biases library for logging (optional, currently unused)
 from gym import spaces  # Import spaces for defining action and observation spaces
 from math import sin, cos, pi, acos, radians, degrees, exp, pow  # Import mathematical functions
 import numpy as np  # Import NumPy for numerical operations
@@ -205,10 +205,19 @@ class Drift_env(gym.Env):
 
     def _calc_reward(self):
         """ Calculate the reward for the current state. """
-        pass  # Define your reward calculation logic here
+        s = self._s
+        l = self._l
+        vx = self._vx
+        self.reward = - (0.01 * (s - 100) * (s - 100) + (l - 5) * (l - 5) + 0.1 * (vx - 30) * (vx - 30))
+        return self.reward
+        # pass  # Define your reward calculation logic here
 
     def _calc_done(self):
         """ Determine if the episode is complete. """
+        if self._s > 200:
+            self._done = 1
+        else:
+            self._done = 0
         return self._done
 
     def reset(self):
