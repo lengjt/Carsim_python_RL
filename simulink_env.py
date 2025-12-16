@@ -1,3 +1,5 @@
+import random
+
 import gym
 from gym import spaces
 import numpy as np
@@ -11,7 +13,7 @@ class SimulinkGymEnv(gym.Env):
     Simulink 模型交互的标准 Gym 环境封装
     """
 
-    def __init__(self, model_name='Pendulum_Model', dt=0.05, stop_time=20.0):
+    def __init__(self, model_name='Pendulum_Model', dt=0.05, stop_time=20.0, new_process=False):
         super(SimulinkGymEnv, self).__init__()
 
         # 1. 配置参数
@@ -29,16 +31,23 @@ class SimulinkGymEnv(gym.Env):
         # 请根据您 Simulink 输出的 obs 维度修改 shape
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
 
-        # 4. 启动 MATLAB Engine
-        print("正在启动 MATLAB Engine，请稍候...")
-        # 连接到已有的 MATLAB 窗口，无需等待启动，直接就能交互
-        names = matlab.engine.find_matlab()
-        if names:
-            self.eng = matlab.engine.connect_matlab(names[0])
+        if new_process:
+            print("为评估环境启动独立的MATLAB进程...")
+            self.eng = matlab.engine.start_matlab()
         else:
-            self.eng = matlab.engine.start_matlab()  # 如果没找到再启动新的
-        print("MATLAB Engine 启动成功！")
-        self.eng.desktop(nargout=0) # 如果想看界面，取消注释
+            # 4. 启动 MATLAB Engine
+            print("正在启动 MATLAB Engine，请稍候...")
+            # 连接到已有的 MATLAB 窗口，无需等待启动，直接就能交互
+            names = matlab.engine.find_matlab()
+            if names:
+                print(f"连接到现有共享MATLAB：{names[0]}")
+                self.eng = matlab.engine.connect_matlab(names[0])
+            else:
+                print("启动新的共享MATLAB进程")
+                self.eng = matlab.engine.start_matlab()
+                self.eng.eval("matlab.engine.shareEngine", nargout=0)
+            print("MATLAB Engine 启动成功！")
+            self.eng.desktop(nargout=0) # 如果想看界面，取消注释
 
         # 加载模型
         model_path = os.path.abspath('.')
@@ -71,13 +80,19 @@ class SimulinkGymEnv(gym.Env):
         # 如果有动作输入的初始值，也建议重置，例如设为0
         self.eng.set_param(self.model_name + '/action_input', 'Value', '0', nargout=0)
 
+        # 随机数设置状态初始值
+        rand_theta = np.random.uniform(-np.pi, np.pi)
+        rand_theta_dot = np.random.uniform(-1.0, 1.0)
+        self.eng.workspace['theta0'] = float(rand_theta)
+        self.eng.workspace['theta_dot0'] = float(rand_theta_dot)
+
         # 启动仿真
         self.eng.set_param(self.model_name, 'SimulationCommand', 'start', nargout=0)
 
         # 等待到达第一个暂停点 (或者 t=0 时刻的数据)
         # 这里我们直接读取初始状态。根据您的模型，可能需要先 continue 一次，或者直接读。
         # 假设 start 后直接可以读取初始 obs
-        obs = self._get_observation()
+        obs = np.array([rand_theta, rand_theta_dot], dtype=np.float32)
 
         return obs
 
