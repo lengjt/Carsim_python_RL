@@ -58,11 +58,11 @@ def main():
 
     # --- 2. 创建环境 ---
     # 训练环境
-    env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0)
+    env = SimulinkGymEnv(model_name, dt=0.001, stop_time=20.0)
     env = Monitor(env, log_dir)  # Monitor 用于记录数据供 TensorBoard 和 EvalCallback 使用
 
     # 评估环境 (EvalCallback 需要一个独立的环境来测试，防止干扰训练)
-    eval_env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0,new_process=True)
+    eval_env = SimulinkGymEnv(model_name, dt=0.001, stop_time=20.0,new_process=True)
     eval_env = Monitor(eval_env, log_dir)
 
     # --- 3. 定义回调函数 (Callbacks) ---

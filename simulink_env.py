@@ -24,12 +24,12 @@ class SimulinkGymEnv(gym.Env):
         # 2. 定义动作空间 (Action Space)
         # 例如：倒立摆是 1 维控制 (力矩)，范围 [-2, 2]
         # 如果是车辆模型，请修改 shape=(2,) 并调整 low/high
-        self.action_space = spaces.Box(low=-2.0, high=2.0, shape=(1,), dtype=np.float32)
+        self.action_space = spaces.Box(low=[-5000.0, -35/180*3.14], high=[5000.0, 35/180*3.14], shape=(2,), dtype=np.float32)
 
         # 3. 定义观测空间 (Observation Space)
         # 例如：[cos(theta), sin(theta), dot_theta] 维度为 3
         # 请根据您 Simulink 输出的 obs 维度修改 shape
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
 
         if new_process:
             print("为评估环境启动独立的MATLAB进程...")
@@ -103,8 +103,10 @@ class SimulinkGymEnv(gym.Env):
         # 1. 写入动作
         # 假设 action 是 numpy 数组，Simulink 输入一般需要标量字符串或向量字符串
         # 如果是单动作：
-        action_val = float(action[0])
-        self.eng.set_param(self.model_name + '/action_input', 'Value', str(action_val), nargout=0)
+        Fx_val = float(action[0])
+        delta_val = float(action[1])
+        self.eng.set_param(self.model_name + '/Fx_input', 'Value', str(Fx_val), nargout=0)
+        self.eng.set_param(self.model_name + '/delta_input', 'Value', str(delta_val), nargout=0)
 
         # 2. 更新暂停时间并继续
         self.current_pause_time += self.dt
@@ -125,7 +127,7 @@ class SimulinkGymEnv(gym.Env):
 
         # 4. 获取数据
         obs = self._get_observation()
-        reward = self._get_reward()
+        reward, done_simu = self.calculate_reward(obs, action)
 
         # 5. 判断 Done
         done = False
@@ -133,9 +135,10 @@ class SimulinkGymEnv(gym.Env):
         sim_time = self.eng.eval('out.time.Data(end)', nargout=1)
         if sim_time >= self.stop_time or status == 'stopped':
             done = True
-
-        # (可选) 如果有其他失败条件（如倒立摆倒下），也可以在这里加：
-        # if abs(obs[0]) > limit: done = True
+        # simulink因为某种原因返回了done = 1.0
+        if done_simu > 0.5:
+            print("simulation stopped before reaching simulation time")
+            done = True
 
         info = {'time': sim_time}
 
@@ -152,10 +155,62 @@ class SimulinkGymEnv(gym.Env):
             print(f"读取 Obs 失败: {e}")
             return np.zeros(self.observation_space.shape, dtype=np.float32)
 
-    def _get_reward(self):
+    def calculate_reward(self, obs, action):
+        # 提取状态 (注意要和 Matlab 输出顺序一致)
+        s, e, mu, vx, r, beta = obs
+
+        # --- 1. 进度奖励 (Progress Reward) ---
+        # 鼓励向前移动，且速度越快奖励越高
+        # 使用沿赛道方向的速度投影：vx * cos(mu)
+        reward_progress = 1.0 * (vx * np.cos(mu))
+
+        # --- 2. 稳定性惩罚 (Stability Penalty) ---
+        # 核心：必须惩罚大的侧偏角和横摆角速度，否则车辆会失控
+        # e: 偏离中心越远，惩罚越大
+        # mu: 车头不正，惩罚
+        # beta: 侧滑严重，重罚 (这是你任务的关键)
+        reward_stability = - 2.0 * abs(mu) \
+                           - 5.0 * abs(beta) \
+                           - 0.5 * abs(r)
+
+        # --- 3. 动作平滑惩罚 (Control Effort) ---
+        # 避免方向盘高频抖动
+        # assuming action[1] is steering angle delta
+        reward_action = -0.1 * (action[2] ** 2)
+
+        # --- 4. 终端奖励/惩罚 (Terminal conditions) ---
+        reward_terminal = -1
+
+        # 情况A: 冲出赛道 (Fail)
+        # 赛道宽10m -> e范围 [-5, 5]
+        if abs(e) > 5.0:
+            reward_terminal = -1000.0
+            done = True
+
+        # 情况B: 完成比赛 (Success)
+        elif s >= 200.0:
+            reward_terminal = +500.0
+            # 额外的时间奖励：步数越少分越高(通常RL框架自带gamma衰减，这里可以给个大额固定分)
+            done = True
+
+        # 情况C: 车辆失控 (Optional)
+        # 如果车头完全调转 (mu > 90度) 或者侧滑角过大
+        elif abs(mu) > np.pi / 2 or abs(beta) > 1.0:
+            reward_terminal = -1000.0
+            done = True
+        else:
+            done = False
+
+        # 总 Reward
+        total_reward = reward_progress + reward_stability + reward_action + reward_terminal
+
+        # 归一化 (可选，建议将 reward 控制在 [-1, 1] 或 [-10, 10] 区间以便训练)
+        return total_reward, done
+
+    def _get_done(self):
         try:
-            reward = float(self.eng.eval('out.reward.Data(end)', nargout=1))
-            return reward
+            done = float(self.eng.eval('out.done.Data(end)', nargout=1))
+            return done
         except:
             return 0.0
 
