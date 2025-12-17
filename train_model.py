@@ -1,5 +1,6 @@
 import os
 import gym
+import numpy as np
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnRewardThreshold, BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -40,6 +41,41 @@ class CheckpointWithBufferCallback(BaseCallback):
         return True
 
 
+def collect_expert_data(env, model, n_episodes=10):
+    print(f"正在收集 {n_episodes} 条专家数据以加速训练...")
+
+    # 获取 Replay Buffer 对象
+    # 注意：SAC 默认会在 model.replay_buffer 中存储
+
+    for episode in range(n_episodes):
+        obs = env.reset()
+        done = False
+        while not done:
+            # === 你的专家规则 ===
+            # 目标：给足油门(1.0)，转向为0(0.0)
+            # 假设 action 范围是 [-1, 1]
+            expert_action = np.array([5000.0, 0.0], dtype=np.float32)
+
+            # 执行一步
+            next_obs, reward, done, info = env.step(expert_action)
+
+            # === 存入 Buffer ===
+            # 需要处理 done 的逻辑，SB3 的 add 需要特定的格式
+            # handle_timeout_termination 用于处理时间限制导致的 done
+            model.replay_buffer.add(
+                obs,
+                next_obs,
+                expert_action,
+                reward,
+                done,
+                [info]
+            )
+
+            obs = next_obs
+
+    print("专家数据收集完成！Replay Buffer 现有数据量:", model.replay_buffer.pos)
+
+
 def main():
     # --- 1. 配置路径与参数 ---
     model_name = 'rlSimplePendulumModel'
@@ -49,8 +85,8 @@ def main():
 
     # 定义最新的检查点路径 (用于断点续训)
     # 我们约定：每次训练结束或中断前，都保存一个名为 "sac_simulink_latest" 的模型
-    last_model_path = os.path.join(log_dir, "sac_simulink_latest.zip")
-    last_buffer_path = os.path.join(log_dir, "sac_simulink_latest_buffer.pkl")
+    last_model_path = os.path.join(log_dir, "sac_simulink_lates.zip")
+    last_buffer_path = os.path.join(log_dir, "sac_simulink_latet_buffer.pkl")
 
     # 创建文件夹
     os.makedirs(best_model_dir, exist_ok=True)
@@ -58,17 +94,17 @@ def main():
 
     # --- 2. 创建环境 ---
     # 训练环境
-    env = SimulinkGymEnv(model_name, dt=0.001, stop_time=20.0)
+    env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0)
     env = Monitor(env, log_dir)  # Monitor 用于记录数据供 TensorBoard 和 EvalCallback 使用
 
     # 评估环境 (EvalCallback 需要一个独立的环境来测试，防止干扰训练)
-    eval_env = SimulinkGymEnv(model_name, dt=0.001, stop_time=20.0,new_process=True)
+    eval_env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0,new_process=True)
     eval_env = Monitor(eval_env, log_dir)
 
     # --- 3. 定义回调函数 (Callbacks) ---
 
     # A. 早停机制: 当评估奖励 > -740 时停止
-    stop_train_callback = StopTrainingOnRewardThreshold(reward_threshold=-740, verbose=1)
+    stop_train_callback = StopTrainingOnRewardThreshold(reward_threshold=500, verbose=1)
 
     # B. 定期评估 & 保存最优模型
     # eval_freq=2000: 每训练 2000 步 (约 5 个 episode)，暂停训练，用 eval_env 跑几次测试
@@ -90,7 +126,7 @@ def main():
     callbacks = [eval_callback, checkpoint_callback]
 
     # --- 4. 断点续训逻辑 (核心) ---
-    total_timesteps = 10000  # 总目标步数
+    total_timesteps = 100000  # 总目标步数
 
     if os.path.exists(last_model_path):
         print(f"检测到上次训练的模型: {last_model_path}，正在加载并继续训练...")
@@ -115,6 +151,9 @@ def main():
                     learning_rate=3e-4,
                     batch_size=256,
                     tensorboard_log="./sac_simulink_tb/")
+
+        # 收集专家数据
+        collect_expert_data(env, model, n_episodes=20)
 
         model.learn(total_timesteps=total_timesteps, callback=callbacks)
 
