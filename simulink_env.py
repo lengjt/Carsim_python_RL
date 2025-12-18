@@ -13,8 +13,18 @@ class SimulinkGymEnv(gym.Env):
     """
     Simulink 模型交互的标准 Gym 环境封装
     """
+    import os
+    import matlab.engine
+    import gym
+    from gym import spaces
+    import numpy as np
 
-    def __init__(self, model_name='Pendulum_Model', dt=0.05, stop_time=20.0, new_process=False):
+    def __init__(self, model_name='RLmodel', dt=0.05, stop_time=20.0, debug_mode=False):
+        """
+        :param debug_mode:
+            False (默认) -> 适用于并行训练。每次都启动全新的 MATLAB 进程，互不干扰。
+            True  -> 适用于调试。尝试连接已打开的共享 MATLAB 窗口。
+        """
         super(SimulinkGymEnv, self).__init__()
 
         # 1. 配置参数
@@ -23,41 +33,47 @@ class SimulinkGymEnv(gym.Env):
         self.stop_time = stop_time
 
         # 2. 定义动作空间 (Action Space)
-        # 例如：倒立摆是 1 维控制 (力矩)，范围 [-2, 2]
-        # 如果是车辆模型，请修改 shape=(2,) 并调整 low/high
+        # 根据你的车辆模型调整 shape=(2,) 和范围
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
 
         # 3. 定义观测空间 (Observation Space)
-        # 例如：[cos(theta), sin(theta), dot_theta] 维度为 3
-        # 请根据您 Simulink 输出的 obs 维度修改 shape
+        # 根据你的 vehicle_dynamics 输出 [s, e, mu, vx, r, beta] 修改 shape=(6,)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
 
-        if new_process:
-            print("为评估环境启动独立的MATLAB进程...")
-            self.eng = matlab.engine.start_matlab()
-        else:
-            # 4. 启动 MATLAB Engine
-            print("正在启动 MATLAB Engine，请稍候...")
-            # 连接到已有的 MATLAB 窗口，无需等待启动，直接就能交互
+        # 4. 启动 MATLAB Engine (多进程核心修改部分)
+        if debug_mode:
+            # --- 调试模式 (单进程) ---
+            print(f"[Process {os.getpid()}] 正在调试模式下连接 MATLAB...")
             names = matlab.engine.find_matlab()
             if names:
-                print(f"连接到现有共享MATLAB：{names[0]}")
+                print(f"连接到现有共享 MATLAB: {names[0]}")
                 self.eng = matlab.engine.connect_matlab(names[0])
             else:
-                print("启动新的共享MATLAB进程")
+                print("未找到共享 MATLAB，启动新进程并共享...")
                 self.eng = matlab.engine.start_matlab()
                 self.eng.eval("matlab.engine.shareEngine", nargout=0)
-            print("MATLAB Engine 启动成功！")
-            self.eng.desktop(nargout=0) # 如果想看界面，取消注释
+            self.eng.desktop(nargout=0)  # 调试模式下显示界面
+        else:
+            # --- 训练模式 (多进程并行) ---
+            # 必须使用 start_matlab() 启动私有进程，绝不能共享
+            print(f"[Process {os.getpid()}] 正在启动独立的 MATLAB Engine (这可能需要几十秒)...")
+            self.eng = matlab.engine.start_matlab()
+            # 训练模式通常不需要显示界面，节省资源
+            # self.eng.desktop(nargout=0)
 
-        # 加载模型
+        # 5. 加载模型
+        # 确保每个进程都切换到了正确的目录
         model_path = os.path.abspath('.')
         self.eng.cd(model_path, nargout=0)
-        self.eng.load_system(self.model_name)
-        print(f"Simulink 模型 '{self.model_name}' 加载成功。")
+
+        try:
+            self.eng.load_system(self.model_name, nargout=0)
+            print(f"[Process {os.getpid()}] Simulink 模型 '{self.model_name}' 加载成功。")
+        except Exception as e:
+            print(f"[Process {os.getpid()}] 模型加载失败: {e}")
+            # 如果是并行环境，这里加载失败通常是因为路径不对，或者 MATLAB 没激活
 
         self.current_pause_time = 0.0
-
     def reset(self):
         """
         重置环境：停止仿真 -> 设置车辆初始状态 -> 启动仿真 -> 返回初始观测
@@ -213,7 +229,7 @@ class SimulinkGymEnv(gym.Env):
         # --- 1. 进度奖励 (Progress) ---
         # 鼓励沿赛道方向的高速行驶
         # 系数 1.0 可以根据 vx 的大小调整，vx~15时 reward~15
-        reward_progress = 1.0 * (vx * np.cos(mu))
+        reward_progress = 0.2 * (vx * np.cos(mu))
 
         # --- 2. 稳定性惩罚 (Stability) ---
         # 关键：beta 和 mu 必须重罚，否则车会横着走
@@ -234,7 +250,7 @@ class SimulinkGymEnv(gym.Env):
 
         # 赛道宽 10m => 左右偏差限幅 +/- 5m
         TRACK_WIDTH_HALF = 5.0
-        TRACK_LENGTH = 200.0
+        TRACK_LENGTH = 50.0
 
         # 情况 A: 成功冲线
         if s >= TRACK_LENGTH:

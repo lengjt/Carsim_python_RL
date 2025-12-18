@@ -1,17 +1,22 @@
 import os
-import gym
+import glob
 import numpy as np
+import gym
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnRewardThreshold, BaseCallback
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold, BaseCallback
 from stable_baselines3.common.monitor import Monitor
-from simulink_env import SimulinkGymEnv  # 确保你之前的环境文件叫这个名字
+
+# 导入你的环境类
+from simulink_env import SimulinkGymEnv
 
 
-# --- 1. 定义一个新的 Callback 类 ---
+# ==================== 1. 辅助类与函数 ====================
+
 class CheckpointWithBufferCallback(BaseCallback):
     """
-    兼容 SB3 v1.6.0 的自定义 Callback
-    用于同时保存模型和 Replay Buffer
+    兼容 SB3 v1.6.0 的自定义 Callback，用于保存模型和 Buffer
     """
 
     def __init__(self, save_freq: int, save_path: str, name_prefix: str = "sac_step", verbose: int = 0):
@@ -21,149 +26,187 @@ class CheckpointWithBufferCallback(BaseCallback):
         self.name_prefix = name_prefix
 
     def _init_callback(self) -> None:
-        # 创建保存目录
         if self.save_path is not None:
             os.makedirs(self.save_path, exist_ok=True)
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq == 0:
-            # 1. 保存模型 (.zip)
+            # 保存模型
             model_path = os.path.join(self.save_path, f"{self.name_prefix}_{self.num_timesteps}_steps")
             self.model.save(model_path)
-
-            # 2. 保存 Replay Buffer (.pkl) - 这是 v1.6.0 缺少的逻辑
+            # 保存 Buffer
             buffer_path = os.path.join(self.save_path, f"{self.name_prefix}_{self.num_timesteps}_steps_replay_buffer")
-            # 注意：v1.6.0 中 model.save_replay_buffer 是存在的，只是 Callback 里没封装
             self.model.save_replay_buffer(buffer_path)
-
             if self.verbose > 1:
-                print(f"Saved model and replay buffer to {self.save_path}")
+                print(f"Saved model and buffer to {self.save_path}")
         return True
 
 
+def find_latest_checkpoint(log_dir, prefix="sac_step"):
+    """自动查找步数最大的模型文件"""
+    # 查找 log_dir/checkpoints/ 下的所有 zip 文件
+    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    if not os.path.exists(ckpt_dir):
+        return None, 0
+
+    search_pattern = os.path.join(ckpt_dir, f"{prefix}_*_steps.zip")
+    files = glob.glob(search_pattern)
+    if not files:
+        return None, 0
+
+    try:
+        # 解析文件名: sac_step_10000_steps.zip -> 10000
+        latest_file = max(files, key=lambda x: int(x.split('_steps')[0].split('_')[-1]))
+        latest_step = int(latest_file.split('_steps')[0].split('_')[-1])
+        return latest_file, latest_step
+    except:
+        return None, 0
+
+
 def collect_expert_data(env, model, n_episodes=10):
-    print(f"正在收集 {n_episodes} 条专家数据以加速训练...")
+    """
+    并在多环境中收集专家数据 (全油门直行)
+    """
+    print(f"正在收集专家数据 ({n_episodes} 批次)...")
 
-    # 获取 Replay Buffer 对象
-    # 注意：SAC 默认会在 model.replay_buffer 中存储
+    # 获取环境数量 (并行环境下 env.num_envs > 1)
+    n_envs = env.num_envs
 
-    for episode in range(n_episodes):
-        obs = env.reset()
-        done = False
-        while not done:
-            # === 你的专家规则 ===
-            # 目标：给足油门(1.0)，转向为0(0.0)
-            # 假设 action 范围是 [-1, 1]
-            expert_action = np.array([5000.0, 0.0], dtype=np.float32)
+    # 专家动作: [油门=1.0, 转向=0.0]
+    # 扩展为 (n_envs, 2) 的矩阵，因为并行环境需要同时接收所有环境的动作
+    expert_action = np.tile([1.0, 0.0], (n_envs, 1))
 
-            # 执行一步
-            next_obs, reward, done, info = env.step(expert_action)
+    # 简单的计数逻辑
+    episodes_collected = 0
+    obs = env.reset()
 
-            # === 存入 Buffer ===
-            # 需要处理 done 的逻辑，SB3 的 add 需要特定的格式
-            # handle_timeout_termination 用于处理时间限制导致的 done
-            model.replay_buffer.add(
-                obs,
-                next_obs,
-                expert_action,
-                reward,
-                done,
-                [info]
-            )
+    while episodes_collected < n_episodes:
+        # 执行动作
+        next_obs, rewards, dones, infos = env.step(expert_action)
 
-            obs = next_obs
+        # 将数据存入 Buffer
+        # SB3 的 add 方法会自动处理 VecEnv 的数据维度
+        model.replay_buffer.add(obs, next_obs, expert_action, rewards, dones, infos)
 
-    print("专家数据收集完成！Replay Buffer 现有数据量:", model.replay_buffer.pos)
+        obs = next_obs
 
+        # 统计完成的 episode 数量 (如果任意一个环境 done 了)
+        if np.any(dones):
+            episodes_collected += np.sum(dones)
+
+    print(f"专家数据收集完成！Buffer 大小: {model.replay_buffer.pos}")
+
+
+# ==================== 2. 主函数 ====================
 
 def main():
-    # --- 1. 配置路径与参数 ---
-    model_name = 'rlSimplePendulumModel'
+    # --- 配置 ---
+    model_name = 'RLmodel'
     log_dir = "./logs/"
     best_model_dir = os.path.join(log_dir, "best_model")
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
 
-    # 定义最新的检查点路径 (用于断点续训)
-    # 我们约定：每次训练结束或中断前，都保存一个名为 "sac_simulink_latest" 的模型
-    last_model_path = os.path.join(log_dir, "sac_simulink_lates.zip")
-    last_buffer_path = os.path.join(log_dir, "sac_simulink_latet_buffer.pkl")
+    # 并行核心数设置 (建议设置为 CPU 物理核心数 - 2)
+    # 注意：每个进程都会启动一个 MATLAB，请确保内存充足 (16GB内存建议设为 4)
+    N_ENVS = 4
 
     # 创建文件夹
     os.makedirs(best_model_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # --- 2. 创建环境 ---
-    # 训练环境
-    env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0)
-    env = Monitor(env, log_dir)  # Monitor 用于记录数据供 TensorBoard 和 EvalCallback 使用
+    # --- 创建并行训练环境 ---
+    # 定义环境参数
+    # debug_mode=False 确保启动新的独立 MATLAB 进程
+    env_kwargs = {'model_name': model_name, 'dt': 0.05, 'stop_time': 20.0, 'debug_mode': False}
 
-    # 评估环境 (EvalCallback 需要一个独立的环境来测试，防止干扰训练)
-    eval_env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0,new_process=True)
+    print(f"正在启动 {N_ENVS} 个并行 MATLAB 环境 (可能需要几分钟)...")
+    env = make_vec_env(
+        lambda: SimulinkGymEnv(**env_kwargs),
+        n_envs=N_ENVS,
+        vec_env_cls=SubprocVecEnv  # <--- 使用多进程类
+    )
+    env = VecMonitor(env, log_dir)  # 并行环境下使用 VecMonitor
+
+    # --- 创建评估环境 (单进程) ---
+    print("正在启动评估环境 (单进程带界面)...")
+    # 评估环境只需一个，debug_mode=False 强制启动独立进程避免干扰
+    eval_env = SimulinkGymEnv(model_name, dt=0.05, stop_time=20.0, debug_mode=True)
     eval_env = Monitor(eval_env, log_dir)
 
-    # --- 3. 定义回调函数 (Callbacks) ---
+    # --- Callbacks ---
+    stop_train_callback = StopTrainingOnRewardThreshold(reward_threshold=700, verbose=1)
 
-    # A. 早停机制: 当评估奖励 > -740 时停止
-    stop_train_callback = StopTrainingOnRewardThreshold(reward_threshold=500, verbose=1)
-
-    # B. 定期评估 & 保存最优模型
-    # eval_freq=2000: 每训练 2000 步 (约 5 个 episode)，暂停训练，用 eval_env 跑几次测试
     eval_callback = EvalCallback(eval_env,
                                  best_model_save_path=best_model_dir,
                                  log_path=best_model_dir,
-                                 eval_freq=2000,
-                                 callback_on_new_best=stop_train_callback,  # 达标就触发早停
-                                 deterministic=True,  # 使用确定性策略评估
+                                 # eval_freq 需要除以并行数，因为 step 是并行的
+                                 eval_freq=2000 // N_ENVS,
+                                 callback_on_new_best=stop_train_callback,
+                                 deterministic=True,
                                  render=False)
 
-    # C. 定期保存 Checkpoint (每 1000 步保存一个，防止断电白跑)
-    checkpoint_callback = CheckpointWithBufferCallback(save_freq=1000,
-                                             save_path=checkpoint_dir,
-                                             name_prefix="sac_step",
-                                             verbose=1)
+    checkpoint_callback = CheckpointWithBufferCallback(
+        # 同样调整保存频率
+        save_freq=1000 // N_ENVS,
+        save_path=checkpoint_dir,
+        name_prefix="sac_step",
+        verbose=1)
 
-    # 将所有回调组合起来
     callbacks = [eval_callback, checkpoint_callback]
 
-    # --- 4. 断点续训逻辑 (核心) ---
-    total_timesteps = 100000  # 总目标步数
+    # --- 断点续训逻辑 ---
+    total_timesteps = 100000
 
-    if os.path.exists(last_model_path):
-        print(f"检测到上次训练的模型: {last_model_path}，正在加载并继续训练...")
+    # 自动查找最新的 checkpoint
+    # latest_model_path, latest_step_count = find_latest_checkpoint(log_dir, "sac_step")
 
-        # 加载模型
-        model = SAC.load(last_model_path, env=env, tensorboard_log="./sac_simulink_tb/")
+    if False:
+        print(f"\n=== 检测到中断的训练 ===")
+        print(f"加载模型: {latest_model_path}")
+        print(f"已完成步数: {latest_step_count}")
 
-        # 加载 Replay Buffer (这对 SAC 这种 Off-policy 算法非常重要，否则又要重新收集数据)
-        if os.path.exists(last_buffer_path):
-            print("正在加载 Replay Buffer...")
-            model.load_replay_buffer(last_buffer_path)
+        # 1. 加载模型
+        model = SAC.load(latest_model_path, env=env, tensorboard_log="./sac_simulink_tb/")
+
+        # 2. 推断 Buffer 路径并加载
+        # 假设文件名格式: sac_step_10000_steps.zip -> sac_step_10000_steps_replay_buffer.pkl
+        buffer_path = latest_model_path.replace(".zip", "_replay_buffer.pkl")
+
+        if os.path.exists(buffer_path):
+            print(f"正在加载经验回放池: {buffer_path}")
+            model.load_replay_buffer(buffer_path)
         else:
-            print("警告：未找到对应的buffer文件！训练将从空Buffer开始")
+            print("警告：未找到 Buffer 文件，将从空 Buffer 继续训练！")
 
-        # reset_num_timesteps=False 表示不要重置步数计数器，接着上次的 Step 继续数
-        print("准备继续训练...")
-        model.learn(total_timesteps=total_timesteps, callback=callbacks, reset_num_timesteps=False)
+        model.num_timesteps = latest_step_count
+        remaining_steps = total_timesteps - latest_step_count
+
+        if remaining_steps > 0:
+            print(f"继续训练剩余 {remaining_steps} 步...")
+            model.learn(total_timesteps=remaining_steps, callback=callbacks, reset_num_timesteps=False)
+        else:
+            print("训练已达到目标步数。")
 
     else:
-        print("未检测到旧模型，开始新的训练...")
+        print("\n=== 开始新的训练 ===")
         model = SAC("MlpPolicy", env, verbose=1,
                     learning_rate=3e-4,
                     batch_size=256,
                     tensorboard_log="./sac_simulink_tb/")
 
-        # 收集专家数据
+        # 收集专家数据 (利用并行环境加速收集)
+        # 跑 20 个 episodes，因为有 4 个环境，实际上每轮跑 4 个，只需跑 5 轮
+        # collect_expert_data(eval_env, model, n_episodes=5)
         collect_expert_data(env, model, n_episodes=20)
 
         model.learn(total_timesteps=total_timesteps, callback=callbacks)
 
-    # --- 5. 训练结束后的保存 ---
-    print("训练结束或触发早停。正在保存最终状态...")
-    final_save_path = os.path.join(log_dir, "sac_simulink_final")
-    model.save(final_save_path)
-    model.save_replay_buffer(f"{final_save_path}_replay_buffer")  # 保存经验池以便下次继续
+    # --- 结束保存 ---
+    print("训练结束。保存最终模型...")
+    final_path = os.path.join(log_dir, "sac_simulink_final")
+    model.save(final_path)
+    model.save_replay_buffer(f"{final_path}_replay_buffer")
 
-    # 关闭环境
     env.close()
     eval_env.close()
 
