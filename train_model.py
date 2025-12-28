@@ -63,38 +63,82 @@ def find_latest_checkpoint(log_dir, prefix="sac_step"):
         return None, 0
 
 
-def collect_expert_data(env, model, n_episodes=10):
+def get_expert_action_dynamic(obs):
     """
-    并在多环境中收集专家数据 (全油门直行)
+    根据当前观测值，计算一个基于规则的专家动作
+    Obs: [s, e, mu, vx, r, beta]
     """
-    print(f"正在收集专家数据 ({n_episodes} 批次)...")
+    s, e, mu, vx, r, beta, ax, omega_r, vy = obs
 
-    # 获取环境数量 (并行环境下 env.num_envs > 1)
-    n_envs = env.num_envs
+    # --- 1. 转向控制 (PD控制器) ---
+    # 目标：让 e -> 0, mu -> 0, r -> 0
+    # 系数需要根据你的物理模型微调，这里给出一组经验值
+    k_mu = 0.7  # 航向误差增益
+    k_r = 0.2  # 横摆角速度阻尼 (用于消除旋转)
+    k_beta = 0.2  # 侧偏角补偿 (用于救车)
 
-    # 专家动作: [油门=1.0, 转向=0.0]
-    # 扩展为 (n_envs, 2) 的矩阵，因为并行环境需要同时接收所有环境的动作
-    expert_action = np.tile([1.0, 0.0], (n_envs, 1))
+    # 计算期望转向角 (注意正负号：假设左转为正)
+    # 逻辑：偏左(e>0)要向右转(-)，车头向左(mu>0)要向右转(-)
+    target_steer = - (k_mu * mu) - (k_r * r) - (k_beta * beta)
 
-    # 简单的计数逻辑
+    # 归一化到 [-1, 1] (假设最大转向角对应 action=1)
+    # 你在 step 里定义了 MAX_STEER = 0.5 rad
+    # 所以 action = target_steer / 0.5
+    steer_action = np.clip(target_steer / 0.5, -1.0, 1.0)
+
+    # --- 2. 油门控制 (状态机) ---
+    # 如果车辆非常不稳定，减速；否则加速
+    if abs(beta) > 0.2 or abs(r) > 0.2:
+        # 失控救车状态：不给油，或者轻微刹车
+        throttle_action = 0
+    elif abs(beta) < 0.05 or abs(r) < 0.05:
+        # 稳定状态：地板油
+        throttle_action = 1.0
+    else:
+        # 中间态：逐渐增加油门
+        throttle_action = 6.7 * (abs(r) - 0.05)
+
+    return np.array([throttle_action, steer_action], dtype=np.float32)
+
+
+def collect_expert_data(env, model, n_episodes=20):
+    print(f"正在使用动态 PID 策略收集专家数据 ({n_episodes} episodes)...")
+
     episodes_collected = 0
     obs = env.reset()
 
-    while episodes_collected < n_episodes:
-        # 执行动作
-        next_obs, rewards, dones, infos = env.step(expert_action)
+    # 适配并行环境或单环境
+    is_vec_env = hasattr(env, 'num_envs')
+    n_envs = env.num_envs if is_vec_env else 1
 
-        # 将数据存入 Buffer
-        # SB3 的 add 方法会自动处理 VecEnv 的数据维度
-        model.replay_buffer.add(obs, next_obs, expert_action, rewards, dones, infos)
+    while episodes_collected < n_episodes:
+        # --- 动态计算动作 ---
+        if is_vec_env:
+            # 针对每个环境分别计算动作
+            actions = []
+            # obs 可能是 (n_envs, 6) 的矩阵
+            for i in range(n_envs):
+                single_obs = obs[i]
+                act = get_expert_action_dynamic(single_obs)
+                actions.append(act)
+            action = np.array(actions)
+        else:
+            action = get_expert_action_dynamic(obs)
+
+        # --- 执行 ---
+        next_obs, rewards, dones, infos = env.step(action)
+
+        # --- 存入 Buffer ---
+        model.replay_buffer.add(obs, next_obs, action, rewards, dones, infos)
 
         obs = next_obs
 
-        # 统计完成的 episode 数量 (如果任意一个环境 done 了)
         if np.any(dones):
-            episodes_collected += np.sum(dones)
+            episodes_collected += np.sum(dones) if is_vec_env else 1
+            if not is_vec_env:
+                obs = env.reset()
 
-    print(f"专家数据收集完成！Buffer 大小: {model.replay_buffer.pos}")
+    print(f"动态专家数据收集完成！Buffer 大小: {model.replay_buffer.pos}")
 
 
 # ==================== 2. 主函数 ====================

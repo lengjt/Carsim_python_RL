@@ -7,8 +7,8 @@ from simulink_env import SimulinkGymEnv
 
 def main():
     # --- 配置 ---
-    model_path = "./logs/sac_model_10000_steps.zip"  # 这里指定你想测试的模型（是最优的？还是最新的？）
-    model_name_slx = 'rlSimplePendulumModel'
+    model_path = "./logs/checkpoints/sac_step_86000_steps.zip"  # 这里指定你想测试的模型（是最优的？还是最新的？）
+    model_name_slx = 'RLmodel'
 
     if not os.path.exists(model_path):
         print(f"错误：找不到模型文件 {model_path}")
@@ -20,7 +20,7 @@ def main():
 
     print("启动 Simulink 环境进行测试...")
     # 注意：这里我们手动实例化环境，方便控制 Render 和窗口
-    env = SimulinkGymEnv(model_name_slx, dt=0.05, stop_time=20.0)
+    env = SimulinkGymEnv(model_name_slx, dt=0.05, stop_time=20.0, debug_mode=True)
 
     # 强制打开 Simulink 窗口以便观察 (如果 env 内部没写，这里补充)
     # env.eng.desktop(nargout=0)
@@ -44,7 +44,8 @@ def main():
             step += 1
 
             # 可以在这里打印每一步的信息
-            # print(f"Step {step}: Action={action}, Reward={reward:.4f}")
+            if step % 10 == 0:
+                print(f"Step {step}: Action={action}, Reward={reward:.4f}")
 
         print(f"回合结束。总步数: {step}, 总奖励: {total_reward:.4f}")
         time.sleep(1)  # 休息一下方便观察 Simulink 窗口

@@ -7,6 +7,7 @@ import matlab
 import matlab.engine
 import os
 import time
+import math
 
 
 class SimulinkGymEnv(gym.Env):
@@ -38,7 +39,7 @@ class SimulinkGymEnv(gym.Env):
 
         # 3. 定义观测空间 (Observation Space)
         # 根据你的 vehicle_dynamics 输出 [s, e, mu, vx, r, beta] 修改 shape=(6,)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
 
         # 4. 启动 MATLAB Engine (多进程核心修改部分)
         if debug_mode:
@@ -96,7 +97,7 @@ class SimulinkGymEnv(gym.Env):
 
         # ---------------- 3. 设置初始动作 (归零) ----------------
         # 车辆模型有两个输入：Fx 和 delta，重置时设为 0
-        self.eng.set_param(self.model_name + '/Fx_input', 'Value', '0', nargout=0)
+        self.eng.set_param(self.model_name + '/Txr_input', 'Value', '0', nargout=0)
         self.eng.set_param(self.model_name + '/delta_input', 'Value', '0', nargout=0)
 
         # ---------------- 4. 设置车辆初始状态 (核心修改) ----------------
@@ -105,12 +106,16 @@ class SimulinkGymEnv(gym.Env):
         # === A. 定值设置 (当前阶段) ===
         init_s = 0.0  # 起点
         init_e = 0.0  # 位于赛道中心
-        init_mu = 0.0  # 车头朝正前方
         init_vx = 15.0  # 初始速度 15 m/s
-        init_r = 0.0  # 无横摆角速度
-        init_beta = 0.0  # 无侧偏角
+        init_r = -75 / 180 * math.pi  # 无横摆角速度
+        init_beta = -10 / 180 * math.pi  # 无侧偏角
+        init_mu = init_beta
+        init_ax = 0.0
+        init_omega_r = init_vx / 0.353
+        init_vy = init_vx * math.tan(init_beta)
         init_x = [float(init_s), float(init_e), float(init_mu),
-                  float(init_vx), float(init_r), float(init_beta)]
+                  float(init_vx), float(init_r), float(init_beta),
+                  float(init_ax), float(init_omega_r), float(init_vy)]
 
         # === B. 随机数设置 (未来阶段 - 取消注释即可启用) ===
         # 想要随机化时，把下面几行取消注释：
@@ -129,7 +134,8 @@ class SimulinkGymEnv(gym.Env):
 
         # ---------------- 7. 返回初始观测值 ----------------
         # 不需要去 Simulink 读，因为是我们刚设定的，直接构建 array 返回最快且最准
-        obs = np.array([init_s, init_e, init_mu, init_vx, init_r, init_beta], dtype=np.float32)
+        obs = np.array([init_s, init_e, init_mu, init_vx, init_r,
+                        init_beta, init_ax, init_omega_r, init_vy], dtype=np.float32)
 
         # 同步更新内部状态
         self.state = obs
@@ -142,13 +148,13 @@ class SimulinkGymEnv(gym.Env):
         # 1. 写入动作
         # RL 输出通常归一化在 [-1, 1]，需要映射回物理意义
         # 假设：最大驱动力 5000N，最大转向角 0.5 rad (约28度)
-        MAX_FORCE = 5000.0
-        MAX_STEER = 35 / 180 * 3.14
+        MAX_TRACTION = 1000.0
+        MAX_STEER = 30 / 180 * 3.14
 
-        Fx_val = float(action[0]) * MAX_FORCE
+        Txr_val = float(action[0]) * MAX_TRACTION
         delta_val = float(action[1]) * MAX_STEER
         # 写入Simulink
-        self.eng.set_param(self.model_name + '/Fx_input', 'Value', str(Fx_val), nargout=0)
+        self.eng.set_param(self.model_name + '/Txr_input', 'Value', str(Txr_val), nargout=0)
         self.eng.set_param(self.model_name + '/delta_input', 'Value', str(delta_val), nargout=0)
 
         # 2. 更新暂停时间并继续
@@ -186,7 +192,7 @@ class SimulinkGymEnv(gym.Env):
 
         if current_sim_time >= self.stop_time:
             done = True
-            info_reward['is_success'] = False # 超时不算成功
+            info_reward['is_success'] = False  # 超时不算成功
 
         # Simulink 意外停止
         if status == 'stopped' and not done:
@@ -221,7 +227,7 @@ class SimulinkGymEnv(gym.Env):
             info: dict (调试信息)
         """
         # 提取状态 (根据你的 vehicle_dynamics 输出顺序)
-        s, e, mu, vx, r, beta = obs
+        s, e, mu, vx, r, beta, ax, omega_r, vy = obs
 
         # 动作 (用于计算平滑惩罚)
         steer_action = action[1]
@@ -229,7 +235,7 @@ class SimulinkGymEnv(gym.Env):
         # --- 1. 进度奖励 (Progress) ---
         # 鼓励沿赛道方向的高速行驶
         # 系数 1.0 可以根据 vx 的大小调整，vx~15时 reward~15
-        reward_progress = 0.2 * (vx * np.cos(mu))
+        reward_progress = 1.0 * (vx * np.cos(mu))
 
         # --- 2. 稳定性惩罚 (Stability) ---
         # 关键：beta 和 mu 必须重罚，否则车会横着走
@@ -249,8 +255,8 @@ class SimulinkGymEnv(gym.Env):
         is_success = False
 
         # 赛道宽 10m => 左右偏差限幅 +/- 5m
-        TRACK_WIDTH_HALF = 5.0
-        TRACK_LENGTH = 50.0
+        TRACK_WIDTH_HALF = 10.0
+        TRACK_LENGTH = 100.0
 
         # 情况 A: 成功冲线
         if s >= TRACK_LENGTH:
