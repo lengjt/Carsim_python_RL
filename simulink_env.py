@@ -3,7 +3,6 @@ import random
 import gym
 from gym import spaces
 import numpy as np
-import matlab
 import matlab.engine
 import os
 import time
@@ -14,11 +13,6 @@ class SimulinkGymEnv(gym.Env):
     """
     Simulink 模型交互的标准 Gym 环境封装
     """
-    import os
-    import matlab.engine
-    import gym
-    from gym import spaces
-    import numpy as np
 
     def __init__(self, model_name='RLmodel', dt=0.05, stop_time=20.0, debug_mode=False):
         """
@@ -36,10 +30,15 @@ class SimulinkGymEnv(gym.Env):
         # 2. 定义动作空间 (Action Space)
         # 根据你的车辆模型调整 shape=(2,) 和范围
         self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+        self.last_action = np.array([0.0, 0.0], dtype=np.float32)
+        self.state = np.zeros(9, dtype=np.float32)
 
         # 3. 定义观测空间 (Observation Space)
         # 根据你的 vehicle_dynamics 输出 [s, e, mu, vx, r, beta] 修改 shape=(6,)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
+
+        # 【新增】课程学习难度等级
+        self.difficulty_level = 0
 
         # 4. 启动 MATLAB Engine (多进程核心修改部分)
         if debug_mode:
@@ -75,6 +74,12 @@ class SimulinkGymEnv(gym.Env):
             # 如果是并行环境，这里加载失败通常是因为路径不对，或者 MATLAB 没激活
 
         self.current_pause_time = 0.0
+
+    def set_difficulty(self, level):
+        """外部调用此方法修改难度"""
+        print(f"[Env] Setting difficulty level to {level}")
+        self.difficulty_level = level
+
     def reset(self):
         """
         重置环境：停止仿真 -> 设置车辆初始状态 -> 启动仿真 -> 返回初始观测
@@ -100,33 +105,45 @@ class SimulinkGymEnv(gym.Env):
         self.eng.set_param(self.model_name + '/Txr_input', 'Value', '0', nargout=0)
         self.eng.set_param(self.model_name + '/delta_input', 'Value', '0', nargout=0)
 
-        # ---------------- 4. 设置车辆初始状态 (核心修改) ----------------
-        # 车辆状态：[s, e, mu, vx, r, beta]
-
-        # === A. 定值设置 (当前阶段) ===
+        # ---------------- 4. 设置车辆初始状态：根据不同难度等级设置不同的初始状态----------------
+        # 车辆状态：[s, e, mu, vx, r, beta, ax, omega_r, vy]
+        # === 默认值 ===
         init_s = 0.0  # 起点
         init_e = 0.0  # 位于赛道中心
-        init_vx = 15.0  # 初始速度 15 m/s
-        init_r = -75 / 180 * math.pi  # 无横摆角速度
-        init_beta = -10 / 180 * math.pi  # 无侧偏角
-        init_mu = init_beta
-        init_ax = 0.0
+        init_mu = 0.0
+        init_ax = 0.0  # 初始纵向加速度为0
+        init_vx = 15.5
+        init_r = 0.0
+        init_beta = 0.0
+
+        # 根据不同难度设置 vx, r, beta
+        if self.difficulty_level == 0:
+            # 阶段0：完全直线，仅改变初始速度
+            init_vx = init_vx + np.random.uniform(-1.0, 1.0)
+            # pass
+        elif self.difficulty_level == 1:
+            # 阶段1：增加初始位置和航向偏差
+            # e: +/- 1m, mu: +/- 0.1 rad
+            init_e = np.random.uniform(-1.0, 1.0)
+            init_mu = np.random.uniform(-0.1, 0.1)
+        elif self.difficulty_level >= 2:
+            # 阶段2及以上：增加车辆不稳定状态 (侧滑、横摆)
+            # e: +/- 2m, mu: +/- 0.2 rad
+            # r: +/- 0.5 rad/s, beta: +/- 0.1 rad
+            init_e = np.random.uniform(-2.0, 2.0)
+            init_mu = np.random.uniform(-0.2, 0.2)
+            init_r = np.random.uniform(-0.5, 0.5)
+            init_beta = np.random.uniform(-0.1, 0.1)
+
         init_omega_r = init_vx / 0.353
         init_vy = init_vx * math.tan(init_beta)
+
         init_x = [float(init_s), float(init_e), float(init_mu),
                   float(init_vx), float(init_r), float(init_beta),
                   float(init_ax), float(init_omega_r), float(init_vy)]
 
-        # === B. 随机数设置 (未来阶段 - 取消注释即可启用) ===
-        # 想要随机化时，把下面几行取消注释：
-        # init_e    = np.random.uniform(-1.0, 1.0)       # 初始可能稍微偏离中心
-        # init_mu   = np.random.uniform(-0.1, 0.1)       # 初始车头稍微歪一点
-        # init_r    = np.random.uniform(-0.5, 0.5)       # 初始带有旋转角速度 (rad/s)
-        # init_beta = np.random.uniform(-0.1, 0.1)       # 初始带有侧滑 (rad)
-
         # ---------------- 5. 写入 MATLAB 工作区 ----------------
         # 注意：Simulink 模型中的 Integrator (积分) 模块必须设置为读取这些变量
-        # 比如 s 的积分器初始条件填 's0'，r 的积分器初始条件填 'r0' 等
         self.eng.workspace['x0'] = matlab.double(init_x)
 
         # ---------------- 6. 启动仿真 ----------------
@@ -136,11 +153,11 @@ class SimulinkGymEnv(gym.Env):
         # 不需要去 Simulink 读，因为是我们刚设定的，直接构建 array 返回最快且最准
         obs = np.array([init_s, init_e, init_mu, init_vx, init_r,
                         init_beta, init_ax, init_omega_r, init_vy], dtype=np.float32)
-
         # 同步更新内部状态
         self.state = obs
-
+        self.last_action = np.array([0.0, 0.0], dtype=np.float32)
         return obs
+
     def step(self, action):
         """
         执行一步：写入动作 -> 继续仿真 -> 等待暂停 -> 读取状态/奖励 -> 判断结束
@@ -176,7 +193,10 @@ class SimulinkGymEnv(gym.Env):
 
         # 4. 获取数据
         obs = self._get_observation()
-        reward, done_logic, info_reward = self.calculate_reward(obs, action)
+        self.state = obs
+
+        reward, done_logic, info_reward = self.calculate_reward(obs, action, self.last_action)
+        self.last_action = action.copy()
 
         # 5. 判断 Done
         done = False
@@ -209,13 +229,13 @@ class SimulinkGymEnv(gym.Env):
         # 注意：这里假设 Simulink 输出了名为 out.obs 的数据
         try:
             # 获取最后一行数据
-            obs = np.array(self.eng.eval('out.obs.Data(1,:,end)', nargout=1)).flatten()
+            obs = np.array(self.eng.eval('out.obs.Data(:,:,end)', nargout=1)).flatten()
             return obs.astype(np.float32)
         except Exception as e:
             print(f"读取 Obs 失败: {e}")
             return np.zeros(self.observation_space.shape, dtype=np.float32)
 
-    def calculate_reward(self, obs, action):
+    def calculate_reward(self, obs, action, last_action):
         """
         计算奖励函数
         输入:
@@ -230,24 +250,28 @@ class SimulinkGymEnv(gym.Env):
         s, e, mu, vx, r, beta, ax, omega_r, vy = obs
 
         # 动作 (用于计算平滑惩罚)
-        steer_action = action[1]
+        current_steer = action[1]
+        last_steer = last_action[1]
+
+        # 转向平滑性惩罚
+        reward_smooth = -10.0 * ((current_steer - last_steer) ** 2)
 
         # --- 1. 进度奖励 (Progress) ---
-        # 鼓励沿赛道方向的高速行驶
+        # 鼓励沿赛道方向的高速行驶，不稳定时对速度的奖励变少？
         # 系数 1.0 可以根据 vx 的大小调整，vx~15时 reward~15
-        reward_progress = 1.0 * (vx * np.cos(mu))
+        reward_progress = 0.5 * (vx * np.cos(mu))
 
         # --- 2. 稳定性惩罚 (Stability) ---
         # 关键：beta 和 mu 必须重罚，否则车会横着走
         # e 的惩罚系数可以小一点，允许轻微偏离中心
         reward_stability = - 0.5 * abs(e) \
-                           - 2.0 * abs(mu) \
+                           - 5.0 * abs(mu) \
                            - 10.0 * abs(beta) \
-                           - 0.1 * abs(r)
+                           - 1.0 * abs(r)
 
         # --- 3. 动作平滑惩罚 (Action Cost) ---
         # 惩罚大幅度打方向盘，减少震荡
-        reward_action = -0.5 * (steer_action ** 2)
+        reward_action = -0.5 * (current_steer ** 2)
 
         # --- 4. 终端判断与奖励 (Terminal) ---
         reward_terminal = 0.0
