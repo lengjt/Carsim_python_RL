@@ -8,6 +8,23 @@ import os
 
 from simulink_env import SimulinkGymEnv
 
+import sys
+import time
+
+class Logger(object):
+    def __init__(self, filename='default.log', stream=sys.stdout):
+        self.terminal = stream
+        self.log = open(filename, 'a', encoding='utf-8')  # 'a' 表示追加模式
+
+    def write(self, message):
+        self.terminal.write(message) # 打印到屏幕
+        self.log.write(message)      # 写入文件
+        self.log.flush()             # 立即存盘，防止程序崩溃时丢失日志
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
 
 def get_pid_action(raw_obs):
     """
@@ -21,19 +38,19 @@ def get_pid_action(raw_obs):
 
     # 转向控制
     target_steer = - (k_mu * mu) - (k_r * r) - (k_beta * beta)
-    steer_action = np.clip(target_steer / 0.5, -1.0, 1.0)  # 假设最大转向0.5
+    steer_action = np.clip(target_steer / 0.523, -1.0, 1.0)  # 假设最大转向0.5
 
     # --- 2. 油门控制 (状态机) ---
     # 如果车辆非常不稳定，减速；否则加速
     if abs(beta) > 0.2 or abs(r) > 0.2:
         # 失控救车状态：不给油，或者轻微刹车
         throttle_action = 0
-    elif abs(beta) < 0.05 or abs(r) < 0.05:
+    elif abs(beta) < 0.05 and abs(r) < 0.05:
         # 稳定状态：地板油
         throttle_action = 1.0
     else:
         # 中间态：逐渐增加油门
-        throttle_action = 6.7 * (abs(r) - 0.05)
+        throttle_action = 1 - 6.7 * (abs(r) - 0.05)
 
     return np.array([throttle_action, steer_action], dtype=np.float32)
 
@@ -76,8 +93,16 @@ def inject_expert_data(env, model, n_steps=1000):
 def main():
     # --- 配置 ---
     model_name = 'RLmodel'
-    log_dir = "./logs_curriculum/"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_dir = f"./logs_curriculum/log_{timestamp}/"
     os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(log_dir+'eval/', exist_ok=True)
+
+    # --- 将运行输出保存到带时间戳的文件名 ---- Logger ---
+    log_filename = os.path.join(log_dir, f"training_log_{timestamp}.txt")
+    sys.stdout = Logger(log_filename, sys.stdout)
+    sys.stderr = Logger(log_filename, sys.stderr)
+    print(f"日志功能已启动，输出将保存至: {log_filename}")
 
     N_ENVS = 2
     # 定义课程阶段
@@ -87,7 +112,7 @@ def main():
     STAGES = [
         {'level': 0, 'steps': 50000, 'threshold': 150, 'inject_prob': 0.5},  # 初始阶段，多注入专家数据
         {'level': 1, 'steps': 100000, 'threshold': 120, 'inject_prob': 0.2},  # 中级，少量注入
-        {'level': 2, 'steps': 200000, 'threshold': 100, 'inject_prob': 0.05}  # 高级，主要靠自己悟
+        {'level': 2, 'steps': 200000, 'threshold': 100, 'inject_prob': 0.05}  # 高级
     ]
 
     # --- 1. 创建环境 (带 Stack 和 Normalize) ---
@@ -95,17 +120,14 @@ def main():
 
     # A. 基础并行环境
     env = make_vec_env(lambda: SimulinkGymEnv(**env_kwargs), n_envs=N_ENVS, vec_env_cls=SubprocVecEnv)
-
+    # Claude: Monitor 应在 Normalize 之前：能够记录真实的未归一化的奖励
+    env = VecMonitor(env, log_dir)
     # B. FrameStack (感知导数信息)
     # n_stack=4: 能够感知到 位置->速度->加速度->加加速度 的变化趋势
     env = VecFrameStack(env, n_stack=4)
-
     # C. Normalize (归一化输入和奖励)
     # 这对神经网络收敛至关重要
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
-
-    # D. Monitor
-    env = VecMonitor(env, log_dir)
 
     # --- 评估环境 (Eval Env) ---
     # 定义评估环境参数 (开启 debug_mode 以便看界面)
@@ -119,6 +141,7 @@ def main():
     # 2. 【关键修正】使用 DummyVecEnv 将其转换为 VecEnv
     # DummyVecEnv 适用于单进程 (评估时用这个最好，不会有多进程通信开销)
     eval_env = DummyVecEnv([make_eval_env])
+    eval_env = VecMonitor(eval_env, log_dir+'eval/')
 
     # 3. 现在它是一个 VecEnv 了，可以安全地添加 VecWrappers
     # 注意：Wrappers 的顺序必须和训练环境完全一致！
@@ -128,15 +151,13 @@ def main():
     # 评估时 norm_reward=False (我们要看真实奖励)，training=False (不更新均值方差)
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, training=False)
 
-    eval_env = VecMonitor(eval_env, log_dir)
-
     # --- 2. 初始化模型 ---
     # 检查是否有 Checkpoint
     last_model_path = os.path.join(log_dir, "latest_model.zip")
     last_buffer_path = os.path.join(log_dir, "latest_buffer.pkl")
     if os.path.exists(last_model_path):
         print("加载之前的模型和归一化参数...")
-        model = SAC.load(last_model_path, env=env)
+        model = SAC.load(last_model_path, env=env, tensorboard_log="./sac_curriculum_tb/")
         # 加载 Replay Buffer
         if os.path.exists(last_buffer_path):
             print(f"正在加载 Replay Buffer (文件较大，请稍候)...")
@@ -145,11 +166,13 @@ def main():
         else:
             print("警告：未找到 Buffer 文件！训练将从空 Buffer 开始（效率较低）。")
         # 加载 VecNormalize 的统计数据 (非常重要！)
-        env = VecNormalize.load(os.path.join(log_dir, "latest_vecnormalize.pkl"), env.venv)
+        env = VecNormalize.load(os.path.join(log_dir, "latest_vecnormalize.pkl"), env)
     else:
         print("✨ 创建新模型...")
         # 稍微调大 batch_size 和 buffer_size 适应 Stack 后的高维数据
-        model = SAC("MlpPolicy", env, verbose=1, batch_size=512, buffer_size=100000, learning_rate=3e-4)
+        model = SAC("MlpPolicy", env, verbose=1, batch_size=512,
+                    buffer_size=100000, learning_rate=3e-4,
+                    tensorboard_log="./sac_curriculum_tb/")
 
     # --- 3. 课程学习循环 ---
     total_steps_so_far = 0
@@ -185,7 +208,7 @@ def main():
                 inject_expert_data(env, model, n_steps=1000)
 
             # --- B. 训练一小段 ---
-            model.learn(total_timesteps=chunk_size, reset_num_timesteps=False)
+            model.learn(total_timesteps=chunk_size, reset_num_timesteps=False, log_interval=50,tb_log_name=f"SAC_{timestamp}")
             steps_trained += chunk_size
             total_steps_so_far += chunk_size
 
@@ -195,6 +218,7 @@ def main():
                 # 同步归一化参数：把训练环境学到的 mean/std 复制给评估环境
                 # 这一步非常关键！否则评估环境不知道怎么归一化，输入全是错的
                 eval_env.obs_rms = env.obs_rms
+                eval_env.ret_rms = env.ret_rms
 
                 # 跑 5 个 episode
                 mean_reward = 0

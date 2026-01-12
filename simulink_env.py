@@ -26,6 +26,7 @@ class SimulinkGymEnv(gym.Env):
         self.model_name = model_name
         self.dt = dt
         self.stop_time = stop_time
+        self.debug_mode = debug_mode
 
         # 2. 定义动作空间 (Action Space)
         # 根据你的车辆模型调整 shape=(2,) 和范围
@@ -34,7 +35,7 @@ class SimulinkGymEnv(gym.Env):
         self.state = np.zeros(9, dtype=np.float32)
 
         # 3. 定义观测空间 (Observation Space)
-        # 根据你的 vehicle_dynamics 输出 [s, e, mu, vx, r, beta] 修改 shape=(6,)
+        # 根据你的 vehicle_dynamics 输出 [s, e, mu, vx, r, beta] 修改 shape=(9, )
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32)
 
         # 【新增】课程学习难度等级
@@ -112,14 +113,14 @@ class SimulinkGymEnv(gym.Env):
         init_e = 0.0  # 位于赛道中心
         init_mu = 0.0
         init_ax = 0.0  # 初始纵向加速度为0
-        init_vx = 15.5
+        init_vx = 15.0
         init_r = 0.0
         init_beta = 0.0
 
         # 根据不同难度设置 vx, r, beta
         if self.difficulty_level == 0:
             # 阶段0：完全直线，仅改变初始速度
-            init_vx = init_vx + np.random.uniform(-1.0, 1.0)
+            init_vx = init_vx + np.random.uniform(-5.0, 5.0)
             # pass
         elif self.difficulty_level == 1:
             # 阶段1：增加初始位置和航向偏差
@@ -141,6 +142,12 @@ class SimulinkGymEnv(gym.Env):
         init_x = [float(init_s), float(init_e), float(init_mu),
                   float(init_vx), float(init_r), float(init_beta),
                   float(init_ax), float(init_omega_r), float(init_vy)]
+
+        # --- 调试模式下在输出端打印初始状态 ---
+        if self.debug_mode:
+            print(f"🔄 [Episode Start] Level {self.difficulty_level} | "
+                  f"vx={init_vx:.2f}, e={init_e:.2f}, mu={init_mu:.3f}, "
+                  f"r={init_r:.3f}, beta={init_beta:.3f}")
 
         # ---------------- 5. 写入 MATLAB 工作区 ----------------
         # 注意：Simulink 模型中的 Integrator (积分) 模块必须设置为读取这些变量
@@ -206,7 +213,7 @@ class SimulinkGymEnv(gym.Env):
 
         # 时间结束
         try:
-            current_sim_time = self.eng.eval('out.time.Data(end)', nargout=1)
+            current_sim_time = self.eng.eval('out.time(end)', nargout=1)
         except:
             current_sim_time = self.current_pause_time
 
@@ -222,6 +229,16 @@ class SimulinkGymEnv(gym.Env):
         info = {'time': current_sim_time}
         info.update(info_reward)
 
+        if done and self.debug_mode:
+            full_data, full_time = self._get_final_states()
+
+            if full_data is not None:
+                # 将大数据放到 info 字典中
+                info['episode_history'] = {
+                    'time': full_time,
+                    'data':full_data
+                }
+
         return obs, reward, done, info
 
     def _get_observation(self):
@@ -229,11 +246,25 @@ class SimulinkGymEnv(gym.Env):
         # 注意：这里假设 Simulink 输出了名为 out.obs 的数据
         try:
             # 获取最后一行数据
-            obs = np.array(self.eng.eval('out.obs.Data(:,:,end)', nargout=1)).flatten()
+            obs = np.array(self.eng.eval('out.obs(:,:,end)', nargout=1)).flatten()
             return obs.astype(np.float32)
         except Exception as e:
             print(f"读取 Obs 失败: {e}")
             return np.zeros(self.observation_space.shape, dtype=np.float32)
+
+    def _get_final_states(self):
+        """
+        辅助函数：从 workspace 读取完整的历史数据
+        """
+        try:
+            full_data = np.squeeze(np.array(self.eng.eval("out.obs(1,:,:)", nargout=1)))
+            full_time = np.array(self.eng.eval("out.time", nargout=1))
+            full_time = full_time.flatten()
+            print(f" [Env] 成功提取历史数据：{full_data.shape} points")
+            return full_data, full_time
+        except Exception as e:
+            print(f"读取最终 Obs 失败，没有收集到episode结束时的所有状态变量信息: {e}")
+            return None, None
 
     def calculate_reward(self, obs, action, last_action):
         """
@@ -313,14 +344,7 @@ class SimulinkGymEnv(gym.Env):
             'reward_stability': reward_stability,
             'is_success': is_success
         }
-
         return total_reward, done, info
-    def _get_done(self):
-        try:
-            done = float(self.eng.eval('out.done.Data(end)', nargout=1))
-            return done
-        except:
-            return 0.0
 
     def close(self):
         self.eng.set_param(self.model_name, 'SimulationCommand', 'stop', nargout=0)
