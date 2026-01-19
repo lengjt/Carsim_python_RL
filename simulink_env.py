@@ -202,7 +202,7 @@ class SimulinkGymEnv(gym.Env):
         obs = self._get_observation()
         self.state = obs
 
-        reward, done_logic, info_reward = self.calculate_reward(obs, action, self.last_action)
+        reward, done_logic, info_reward = self._calculate_reward(obs, action, self.last_action)
         self.last_action = action.copy()
 
         # 5. 判断 Done
@@ -266,85 +266,221 @@ class SimulinkGymEnv(gym.Env):
             print(f"读取最终 Obs 失败，没有收集到episode结束时的所有状态变量信息: {e}")
             return None, None
 
-    def calculate_reward(self, obs, action, last_action):
+    def _calculate_reward(self, obs, current_action, last_action):
         """
-        计算奖励函数
-        输入:
-            obs: [s, e, mu, vx, r, beta] (须与 Matlab 输出顺序一致)
-            action: [Fx_norm, delta_norm] (归一化后的动作)
-        输出:
-            reward: float
-            done: bool (逻辑上的结束)
-            info: dict (调试信息)
+        奖励函数设计：最快通过直线赛道
+        核心原则：
+        1. 奖励前进：沿赛道方向的速度/位移
+        2. 惩罚失控：过大的侧滑、横摆
+        3. 惩罚出界：软边界+硬边界
+        4. 惩罚抖动：动作平滑性
         """
-        # 提取状态 (根据你的 vehicle_dynamics 输出顺序)
+        track_width = 10.0
+        track_length = 100.0
+
         s, e, mu, vx, r, beta, ax, omega_r, vy = obs
 
-        # 动作 (用于计算平滑惩罚)
-        current_steer = action[1]
+        reward = 0.0
+
+        # ============ 1. 前进奖励（最重要）============
+        # 奖励沿赛道方向的速度分量
+        # Vx是车身纵向速度，Vy是车身横向速度
+        # e_phi是车身与赛道方向的夹角
+        V_along_track = vx * np.cos(mu) - vy * np.sin(mu)
+        # 归一化并给予奖励（假设期望速度范围0-30m/s）
+        max_expected_speed = 30.0
+        progress_reward = V_along_track / max_expected_speed
+        reward += 2.0 * progress_reward
+        # 额外奖励：位移增量（可选，与速度奖励二选一或组合使用）
+        # delta_s = s - last_s
+        # reward += 0.5 * delta_s
+
+        # ============ 2. 稳定性约束 ============
+        # 2.1 惩罚过大的质心侧偏角（防止漂移失控）
+        beta_threshold = np.radians(12)  # 12度以内不惩罚
+        beta_max = np.radians(30)  # 超过30度严重惩罚
+
+        if abs(beta) > beta_threshold:
+            beta_excess = abs(beta) - beta_threshold
+            beta_range = beta_max - beta_threshold
+            beta_penalty = -0.5 * (beta_excess / beta_range) ** 2
+            reward += beta_penalty
+
+        # 2.2 惩罚过大的横摆角速度（防止打转）
+        r_threshold = np.radians(25)  # 25度/秒以内不惩罚
+        r_max = np.radians(60)  # 超过60度/秒严重惩罚
+
+        if abs(r) > r_threshold:
+            r_excess = abs(r) - r_threshold
+            r_range = r_max - r_threshold
+            r_penalty = -0.3 * (r_excess / r_range) ** 2
+            reward += r_penalty
+
+        # 2.3 惩罚过大的航向偏差（车头方向偏离赛道太多）
+        mu_threshold = np.radians(20)  # 20度以内不惩罚
+        mu_max = np.radians(60)
+
+        if abs(mu) > mu_threshold:
+            e_phi_excess = abs(mu) - mu_threshold
+            e_phi_range = mu_max - mu_threshold
+            e_phi_penalty = -0.3 * (e_phi_excess / e_phi_range) ** 2
+            reward += e_phi_penalty
+
+        # ============ 3. 边界约束 ============
+        track_half_width = track_width / 2.0
+
+        # 3.1 软边界惩罚：接近边界时逐渐增加惩罚
+        boundary_margin = 1.0  # 距离边界1m开始警告
+        dist_to_boundary = track_half_width - abs(e)
+
+        if boundary_margin > dist_to_boundary > 0:
+            # 使用指数型惩罚，越接近边界惩罚增长越快
+            boundary_penalty = -0.8 * np.exp(-3 * dist_to_boundary / boundary_margin)
+            reward += boundary_penalty
+
+        # 3.2 硬边界惩罚：超出边界（这种情况通常会触发done）
+        if abs(e) >= track_half_width:
+            reward += -10.0  # 严重惩罚
+
+        # ============ 4. 动作平滑性（抑制抖动）============
+        # 需要在__init__中初始化: self.last_action = 0.0
+        current_steer = current_action[1]
+        current_traction = current_action[0]
         last_steer = last_action[1]
+        last_traction = last_action[0]
 
-        # 转向平滑性惩罚
-        reward_smooth = -10.0 * ((current_steer - last_steer) ** 2)
+        steer_change = abs(current_steer - last_steer)
+        traction_change = abs(current_traction - last_traction)
 
-        # --- 1. 进度奖励 (Progress) ---
-        # 鼓励沿赛道方向的高速行驶，不稳定时对速度的奖励变少？
-        # 系数 1.0 可以根据 vx 的大小调整，vx~15时 reward~15
-        reward_progress = 0.5 * (vx * np.cos(mu))
+        # 归一化动作变化（假设动作范围[-1, 1]，最大变化为2）
+        max_action_change = 2.0
+        steer_normalized_change = steer_change / max_action_change
+        traction_normalized_change = traction_change / max_action_change
 
-        # --- 2. 稳定性惩罚 (Stability) ---
-        # 关键：beta 和 mu 必须重罚，否则车会横着走
-        # e 的惩罚系数可以小一点，允许轻微偏离中心
-        reward_stability = - 0.5 * abs(e) \
-                           - 5.0 * abs(mu) \
-                           - 10.0 * abs(beta) \
-                           - 1.0 * abs(r)
+        # 平滑性惩罚
+        smoothness_penalty = -0.3 * (steer_normalized_change ** 2) - 0.1 * (traction_normalized_change ** 2)
+        reward += smoothness_penalty
 
-        # --- 3. 动作平滑惩罚 (Action Cost) ---
-        # 惩罚大幅度打方向盘，减少震荡
-        reward_action = -0.5 * (current_steer ** 2)
+        # ============ 5. 终点奖励 ============
+        # 成功到达终点给予大奖励
+        if s >= track_length:
+            # 根据用时给予额外奖励（用时越短奖励越高）
+            time_bonus = max(0.0, 10.0 - self.current_pause_time * 0.5)
+            reward += 20.0 + time_bonus
 
-        # --- 4. 终端判断与奖励 (Terminal) ---
-        reward_terminal = 0.0
+        # ============ 6. 存活奖励（可选）============
+        # 每一步给予小的存活奖励，鼓励agent保持在赛道内
+        reward += 0.1
+
+        """
+        检查是否结束episode
+        """
         done = False
         is_success = False
 
-        # 赛道宽 10m => 左右偏差限幅 +/- 5m
-        TRACK_WIDTH_HALF = 10.0
-        TRACK_LENGTH = 100.0
-
         # 情况 A: 成功冲线
-        if s >= TRACK_LENGTH:
-            reward_terminal = 500.0
+        if s >= track_length:
             done = True
             is_success = True
-            print(f"Success! Reached target at time {self.current_pause_time:.2f}")
+            print(f"Success! Reached target at time {self.current_pause_time:.2f}, reward = {reward:.2f}")
 
         # 情况 B: 冲出赛道 (Fail)
-        elif abs(e) > TRACK_WIDTH_HALF:
-            reward_terminal = -500.0
+        elif abs(e) > track_half_width:
             done = True
-            print(f"Failed! Out of track (e={e:.2f})")
+            print(f"Failed! Out of track (e={e:.2f}), reward = {reward:.2f}")
 
         # 情况 C: 车辆完全失控 (掉头或侧滑过大)
         # mu > 90度 (1.57 rad) 或 beta > 1.0 rad
         elif abs(mu) > 1.57 or abs(beta) > 1.0:
-            reward_terminal = -500.0
             done = True
-            print(f"Failed! Unstable (mu={mu:.2f}, beta={beta:.2f})")
-
-        # 总分
-        total_reward = reward_progress + reward_stability + reward_action + reward_terminal
-
-        # 缩放总分 (可选，为了让数值在 -10 到 10 之间，利于神经网络收敛)
-        total_reward = total_reward * 0.1
+            print(f"Failed! Unstable (mu={mu:.2f}, beta={beta:.2f}), reward = {reward:.2f}")
 
         info = {
-            'reward_progress': reward_progress,
-            'reward_stability': reward_stability,
-            'is_success': is_success
-        }
-        return total_reward, done, info
+                'reward_progress': progress_reward,
+                'is_success': is_success
+            }
+
+        return reward, done, info
+
+    # def calculate_reward(self, obs, action, last_action):
+    #     """
+    #     计算奖励函数
+    #     输入:
+    #         obs: [s, e, mu, vx, r, beta] (须与 Matlab 输出顺序一致)
+    #         action: [Fx_norm, delta_norm] (归一化后的动作)
+    #     输出:
+    #         reward: float
+    #         done: bool (逻辑上的结束)
+    #         info: dict (调试信息)
+    #     """
+    #     # 提取状态 (根据你的 vehicle_dynamics 输出顺序)
+    #     s, e, mu, vx, r, beta, ax, omega_r, vy = obs
+    #
+    #     # 动作 (用于计算平滑惩罚)
+    #     current_steer = action[1]
+    #     last_steer = last_action[1]
+    #
+    #     # 转向平滑性惩罚
+    #     reward_smooth = -10.0 * ((current_steer - last_steer) ** 2)
+    #
+    #     # --- 1. 进度奖励 (Progress) ---
+    #     # 鼓励沿赛道方向的高速行驶，不稳定时对速度的奖励变少？
+    #     # 系数 1.0 可以根据 vx 的大小调整，vx~15时 reward~15
+    #     reward_progress = 0.5 * (vx * np.cos(mu))
+    #
+    #     # --- 2. 稳定性惩罚 (Stability) ---
+    #     # 关键：beta 和 mu 必须重罚，否则车会横着走
+    #     # e 的惩罚系数可以小一点，允许轻微偏离中心
+    #     reward_stability = - 0.5 * abs(e) \
+    #                        - 5.0 * abs(mu) \
+    #                        - 10.0 * abs(beta) \
+    #                        - 1.0 * abs(r)
+    #
+    #     # --- 3. 动作平滑惩罚 (Action Cost) ---
+    #     # 惩罚大幅度打方向盘，减少震荡
+    #     reward_action = -0.5 * (current_steer ** 2)
+    #
+    #     # --- 4. 终端判断与奖励 (Terminal) ---
+    #     reward_terminal = 0.0
+    #     done = False
+    #     is_success = False
+    #
+    #     # 赛道宽 10m => 左右偏差限幅 +/- 5m
+    #     TRACK_WIDTH_HALF = 10.0
+    #     TRACK_LENGTH = 100.0
+    #
+    #     # 情况 A: 成功冲线
+    #     if s >= TRACK_LENGTH:
+    #         reward_terminal = 500.0
+    #         done = True
+    #         is_success = True
+    #         print(f"Success! Reached target at time {self.current_pause_time:.2f}")
+    #
+    #     # 情况 B: 冲出赛道 (Fail)
+    #     elif abs(e) > TRACK_WIDTH_HALF:
+    #         reward_terminal = -500.0
+    #         done = True
+    #         print(f"Failed! Out of track (e={e:.2f})")
+    #
+    #     # 情况 C: 车辆完全失控 (掉头或侧滑过大)
+    #     # mu > 90度 (1.57 rad) 或 beta > 1.0 rad
+    #     elif abs(mu) > 1.57 or abs(beta) > 1.0:
+    #         reward_terminal = -500.0
+    #         done = True
+    #         print(f"Failed! Unstable (mu={mu:.2f}, beta={beta:.2f})")
+    #
+    #     # 总分
+    #     total_reward = reward_progress + reward_stability + reward_action + reward_terminal
+    #
+    #     # 缩放总分 (可选，为了让数值在 -10 到 10 之间，利于神经网络收敛)
+    #     total_reward = total_reward * 0.1
+    #
+    #     info = {
+    #         'reward_progress': reward_progress,
+    #         'reward_stability': reward_stability,
+    #         'is_success': is_success
+    #     }
+    #     return total_reward, done, info
 
     def close(self):
         self.eng.set_param(self.model_name, 'SimulationCommand', 'stop', nargout=0)
